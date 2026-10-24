@@ -322,14 +322,41 @@ void FlattenModulesPass::runOnOperation() {
                                  &oldToNewInnerSyms, &instanceReplacer,
                                  &pathsTable, instanceRef);
 
-        if (failed(mlir::inlineRegion(inliner, config.getCloneCallback(),
-                                      &module.getBody(), inst,
-                                      inst.getOperands(), inst.getResults(),
-                                      std::nullopt, !isLastModuleUse))) {
+        // The generic inliner splits and merges the suffix at the insertion
+        // point. Repeating that after every instance is quadratic in a large
+        // graph block. Inline at the terminator, then move only the new ops
+        // back to the instance to preserve the original printed order.
+        auto *inlineBlock = inst->getBlock();
+        auto inlinePoint = std::next(inst->getIterator());
+        Operation *parentTerminator = nullptr;
+        Operation *oldTail = nullptr;
+        if (inlineBlock == parentModule.getBodyBlock()) {
+          parentTerminator = inlineBlock->getTerminator();
+          oldTail = parentTerminator->getPrevNode();
+          assert(oldTail && "the parent block contains the instance");
+          inlinePoint = parentTerminator->getIterator();
+        }
+
+        if (failed(mlir::inlineRegion(
+                inliner, config.getCloneCallback(), &module.getBody(),
+                inlineBlock, inlinePoint, inst.getOperands(), inst.getResults(),
+                std::nullopt, !isLastModuleUse))) {
           inst.emitError("failed to inline '")
               << module.getModuleName() << "' into instance '"
               << inst.getInstanceName() << "'";
           return signalPassFailure();
+        }
+
+        if (oldTail) {
+          assert(oldTail->getBlock() == inlineBlock);
+          assert(inlineBlock->getTerminator() == parentTerminator);
+          auto begin = std::next(oldTail->getIterator());
+          auto end = parentTerminator->getIterator();
+          auto destination = std::next(inst->getIterator());
+          if (begin != end && destination != begin) {
+            auto &operations = inlineBlock->getOperations();
+            operations.splice(destination, operations, begin, end);
+          }
         }
 
         inst.erase();
