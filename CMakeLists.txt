@@ -113,7 +113,12 @@ else()
   set(BUILD_SHARED_LIBS OFF CACHE BOOL "Default to building a static mondo-lib")
   set(CMAKE_PLATFORM_NO_VERSIONED_SONAME ON CACHE BOOL
     "Python soname linked libraries are bad")
-  set(CMAKE_VISIBILITY_INLINES_HIDDEN ON CACHE BOOL "Hide inlines")
+  # Keep the default local to CIRCT. A cache entry created here is also seen
+  # by LLVM on the next configure, changing its commands and invalidating PCHs.
+  # Preserve an explicitly supplied parent/cache setting.
+  if (NOT DEFINED CMAKE_VISIBILITY_INLINES_HIDDEN)
+    set(CMAKE_VISIBILITY_INLINES_HIDDEN ON)
+  endif()
 
   # The -fvisibility=hidden option only works for static builds.
   if (BUILD_SHARED_LIBS AND (CMAKE_CXX_VISIBILITY_PRESET STREQUAL "hidden"))
