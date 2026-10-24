@@ -16,17 +16,20 @@
 #include "circt/Dialect/HW/HWOps.h"
 #include "circt/Dialect/HW/HWTypes.h"
 #include "mlir/Dialect/Arith/IR/Arith.h"
+#include "mlir/Dialect/ControlFlow/Transforms/StructuralTypeConversions.h"
 #include "mlir/Dialect/Func/IR/FuncOps.h"
 #include "mlir/IR/Builders.h"
 #include "mlir/IR/BuiltinOps.h"
 #include "mlir/IR/BuiltinTypes.h"
 #include "mlir/IR/Location.h"
 #include "mlir/IR/PatternMatch.h"
+#include "mlir/IR/RegionGraphTraits.h"
 #include "mlir/IR/Value.h"
 #include "mlir/Support/LLVM.h"
 #include "mlir/Support/LogicalResult.h"
 #include "mlir/Transforms/DialectConversion.h"
 #include "mlir/Transforms/GreedyPatternRewriteDriver.h"
+#include "llvm/ADT/SCCIterator.h"
 
 #define DEBUG_TYPE "arc-lower-arrays"
 
@@ -64,8 +67,26 @@ Value asIndex(Value value, OpBuilder &builder) {
                                       value);
 }
 
+// Allocations introduced while lowering array values have one storage slot per
+// SSA definition. Keep these slots in the function entry block so a definition
+// executed in a loop does not consume additional stack on every iteration.
+// Cyclic block arguments are materialized into their own storage below to keep
+// old dynamic values alive when a definition is executed again.
+ArrayRefAllocOp createArrayRefAlloc(OpBuilder &builder, Location loc, Type type,
+                                    ArrayAttr init) {
+  OpBuilder::InsertionGuard guard(builder);
+  auto *parent = builder.getBlock()->getParentOp();
+  auto func = dyn_cast<func::FuncOp>(parent);
+  if (!func)
+    func = parent->getParentOfType<func::FuncOp>();
+  if (func && parent == func.getOperation() &&
+      builder.getBlock() != &func.getBody().front())
+    builder.setInsertionPointToStart(&func.getBody().front());
+  return ArrayRefAllocOp::create(builder, loc, type, init);
+}
+
 Value cloneArrayRef(Value value, OpBuilder &builder, Location loc) {
-  Value newAlloc = ArrayRefAllocOp::create(builder, loc, value.getType(), {});
+  Value newAlloc = createArrayRefAlloc(builder, loc, value.getType(), {});
   return ArrayRefCopyOp::create(builder, loc, newAlloc, value);
 }
 
@@ -75,18 +96,27 @@ struct ConvertFunc : public OpConversionPattern<func::FuncOp> {
   LogicalResult
   matchAndRewrite(func::FuncOp op, OpAdaptor adaptor,
                   ConversionPatternRewriter &rewriter) const override {
+    // Record which original block arguments have value semantics. Existing
+    // array references must retain their original aliasing behavior.
+    SmallVector<SmallVector<unsigned>> valueArrayArguments;
+    for (auto &block : op.getBody()) {
+      auto &arguments = valueArrayArguments.emplace_back();
+      for (auto argument : block.getArguments())
+        if (isa<ArrayType>(argument.getType()))
+          arguments.push_back(argument.getArgNumber());
+    }
+
     const TypeConverter &converter = *getTypeConverter();
     TypeConverter::SignatureConversion conversion(op.getNumArguments());
 
     SmallVector<Type> newArgTypes;
     SmallVector<Type> newResultTypes;
-    assert(op.getBody().getBlocks().size() == 1);
-
-    // Any array-typed results become parameters.
-    Operation *ret = op.getBody().front().getTerminator();
-    for (Value result : ret->getOperands()) {
-      if (isa<ArrayType>(result.getType())) {
-        Type newType = converter.convertType(result.getType());
+    // Any array-typed results become parameters. Inspect the function type
+    // rather than the entry terminator: functions may have multiple blocks
+    // or no body, and branch operands are not function results.
+    for (Type resultType : op.getResultTypes()) {
+      if (isa<ArrayType>(resultType)) {
+        Type newType = converter.convertType(resultType);
         conversion.addInputs(newType);
         newArgTypes.push_back(newType);
       }
@@ -107,6 +137,42 @@ struct ConvertFunc : public OpConversionPattern<func::FuncOp> {
     rewriter.modifyOpInPlace(op, [&] {
       op.setType(FunctionType::get(getContext(), newArgTypes, newResultTypes));
     });
+
+    if (op.isExternal())
+      return success();
+    SmallPtrSet<Block *, 8> cyclicBlocks;
+    for (auto scc = llvm::scc_begin(&op.getBody()); !scc.isAtEnd(); ++scc)
+      if (scc.hasCycle())
+        cyclicBlocks.insert(scc->begin(), scc->end());
+
+    assert(valueArrayArguments.size() == op.getBody().getBlocks().size());
+    for (auto [index, block] : llvm::enumerate(op.getBody())) {
+      if (!cyclicBlocks.contains(&block))
+        continue;
+      OpBuilder::InsertionGuard guard(rewriter);
+      rewriter.setInsertionPointToStart(&block);
+      SmallVector<std::pair<Value, Value>> staged;
+      for (unsigned argIndex : valueArrayArguments[index]) {
+        auto argument = block.getArgument(argIndex);
+        auto type = cast<ArrayRefType>(argument.getType());
+        auto temporary =
+            createArrayRefAlloc(rewriter, argument.getLoc(), type, {});
+        auto snapshot =
+            createArrayRefAlloc(rewriter, argument.getLoc(), type, {});
+        auto copy = ArrayRefCopyOp::create(rewriter, argument.getLoc(),
+                                           temporary, argument);
+        staged.emplace_back(copy, snapshot);
+      }
+      // A branch transfers block arguments simultaneously. Stage every incoming
+      // value before overwriting any owned snapshot, including for swaps.
+      for (auto [stagedValue, snapshot] : staged) {
+        auto copy = cast<ArrayRefCopyOp>(stagedValue.getDefiningOp());
+        auto argument = copy.getSource();
+        auto value = ArrayRefCopyOp::create(rewriter, argument.getLoc(),
+                                            snapshot, stagedValue);
+        rewriter.replaceAllUsesExcept(argument, value, copy);
+      }
+    }
 
     return success();
   }
@@ -150,7 +216,7 @@ struct ConvertCall : public OpConversionPattern<func::CallOp> {
       auto arrayRefType = ArrayRefType::get(arrayType.getElementType(),
                                             arrayType.getNumElements());
       Value alloc =
-          ArrayRefAllocOp::create(rewriter, op.getLoc(), arrayRefType, {});
+          createArrayRefAlloc(rewriter, op.getLoc(), arrayRefType, {});
       newOperands.push_back(alloc);
     }
     for (Value operand : adaptor.getOperands()) {
@@ -181,8 +247,8 @@ struct ConvertAggregateConstant
                   ConversionPatternRewriter &rewriter) const override {
     auto newType =
         cast<ArrayRefType>(getTypeConverter()->convertType(op.getType()));
-    Value newOp = ArrayRefAllocOp::create(rewriter, op.getLoc(), newType,
-                                          op.getFieldsAttr());
+    Value newOp =
+        createArrayRefAlloc(rewriter, op.getLoc(), newType, op.getFieldsAttr());
     rewriter.replaceOp(op, newOp);
     return success();
   }
@@ -243,7 +309,7 @@ struct ConvertArrayConcat : public OpConversionPattern<ArrayConcatOp> {
   matchAndRewrite(ArrayConcatOp op, OpAdaptor adaptor,
                   ConversionPatternRewriter &rewriter) const override {
     Type destType = getTypeConverter()->convertType(op.getType());
-    Value dest = ArrayRefAllocOp::create(rewriter, op.getLoc(), destType, {});
+    Value dest = createArrayRefAlloc(rewriter, op.getLoc(), destType, {});
 
     // ArrayConcatOp's operands are ordered from most significant to least
     // significant.
@@ -269,7 +335,7 @@ struct ConvertArrayCreate : public OpConversionPattern<ArrayCreateOp> {
   matchAndRewrite(ArrayCreateOp op, OpAdaptor adaptor,
                   ConversionPatternRewriter &rewriter) const override {
     Type newType = getTypeConverter()->convertType(op.getType());
-    Value alloc = ArrayRefAllocOp::create(rewriter, op.getLoc(), newType, {});
+    Value alloc = createArrayRefAlloc(rewriter, op.getLoc(), newType, {});
     Value create = ArrayRefCreateOp::create(rewriter, op.getLoc(), newType,
                                             alloc, adaptor.getInputs());
     rewriter.replaceOp(op, create);
@@ -444,7 +510,8 @@ void LowerArraysPass::runOnOperation() {
   target.addDynamicallyLegalOp<func::FuncOp>([&](func::FuncOp func) {
     FunctionType fty = func.getFunctionType();
     return converter.isLegal(fty.getInputs()) &&
-           converter.isLegal(fty.getResults());
+           converter.isLegal(fty.getResults()) &&
+           converter.isLegal(&func.getBody());
   });
   // An ArrayGetOp may legally return an array if the input type was a nested
   // array. Similarly for ArrayCreateOp and ArrayInjectOp.
@@ -461,7 +528,7 @@ void LowerArraysPass::runOnOperation() {
                                          ValueRange values, Location loc,
                                          Type fromType) -> Value {
     assert(isa<ArrayType>(fromType));
-    Value alloc = ArrayRefAllocOp::create(b, loc, type, {});
+    Value alloc = createArrayRefAlloc(b, loc, type, {});
     return ArrayRefFromArrayOp::create(b, loc, type, alloc, values.front());
   });
 
@@ -480,6 +547,8 @@ void LowerArraysPass::runOnOperation() {
                ConvertStateRead, ConvertStateWrite, ConvertRootInput,
                ConvertRootOutput, ConvertUnrealizedConversionCast>(
       converter, &getContext());
+  cf::populateCFStructuralTypeConversionsAndLegality(converter, patterns,
+                                                     target);
 
   ConversionConfig config;
   config.allowPatternRollback = false;
