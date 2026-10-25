@@ -207,9 +207,17 @@ applyEnableTransformation(arc::DefineOp arcOp, arc::StateOp stateOp,
   stateOp.getEnableMutable().assign(enableCond);
 
   for (size_t i = 0, e = outputOp.getOutputs().size(); i < e; ++i) {
-    if (enableInfos[i].selfArg.hasOneUse())
-      inputs[enableInfos[i].selfArg.getArgNumber()] = hw::ConstantOp::create(
-          builder, stateOp.getLoc(), enableInfos[i].selfArg.getType(), 0);
+    if (enableInfos[i].selfArg.hasOneUse()) {
+      auto type = enableInfos[i].selfArg.getType();
+      auto width = hw::getBitWidth(type);
+      if (width >= 0) {
+        Value zero = hw::ConstantOp::create(builder, stateOp.getLoc(),
+                                            builder.getIntegerType(width), 0);
+        if (zero.getType() != type)
+          zero = hw::BitcastOp::create(builder, stateOp.getLoc(), type, zero);
+        inputs[enableInfos[i].selfArg.getArgNumber()] = zero;
+      }
+    }
   }
 
   stateOp.getInputsMutable().assign(inputs);
