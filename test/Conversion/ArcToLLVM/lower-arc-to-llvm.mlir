@@ -340,7 +340,13 @@ func.func @NextWakeup(%state: !arc.storage, %t: i64) -> i64 {
   // CHECK-NEXT: %[[RGEP:.*]] = llvm.getelementptr %[[STATE]][16] : (!llvm.ptr) -> !llvm.ptr, i8
   // CHECK-NEXT: %[[OUT:.*]] = llvm.load %[[RGEP]] : !llvm.ptr -> i64
   %0 = arc.get_next_wakeup %ctx
-  // CHECK-NEXT: llvm.return %[[OUT]]
+  // CHECK-NEXT: %[[FLAGPTR:.*]] = llvm.getelementptr %[[STATE]][8] : (!llvm.ptr) -> !llvm.ptr, i8
+  // CHECK-NEXT: %[[STATUS:.*]] = llvm.load %[[FLAGPTR]] : !llvm.ptr -> i8
+  // CHECK-NEXT: %[[ZERO:.*]] = llvm.mlir.constant(0 : i8) : i8
+  // CHECK-NEXT: %[[STOPPED:.*]] = llvm.icmp "ne" %[[STATUS]], %[[ZERO]] : i8
+  // CHECK-NEXT: %[[NEVER:.*]] = llvm.mlir.constant(-1 : i64) : i64
+  // CHECK-NEXT: %[[PENDING:.*]] = llvm.select %[[STOPPED]], %[[NEVER]], %[[OUT]] : i1, i64
+  // CHECK-NEXT: llvm.return %[[PENDING]]
   return %0 : i64
 }
 

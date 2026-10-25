@@ -620,7 +620,9 @@ def GetNextWakeupOp : ArcOp<"get_next_wakeup", [
     absolute timestamp in femtoseconds, not a duration relative to the current
     simulation time. A wakeup at the current time requests an immediate
     re-evaluation in the same time step; a value of `UINT64_MAX` indicates that
-    no wakeup is pending.
+    no wakeup is pending. Once simulation termination is requested, returns
+    `UINT64_MAX` regardless of any scheduled wakeups, allowing the driver to
+    finish after the current evaluation.
   }];
   let arguments = (ins ContextType:$arcContext);
   let results = (outs I64:$time);

@@ -1124,8 +1124,20 @@ struct GetNextWakeupOpLowering
     Value slotPtr = LLVM::GEPOp::create(
         rewriter, loc, ptrType, rewriter.getI8Type(), adaptor.getArcContext(),
         ArrayRef<LLVM::GEPArg>{arc::kNextWakeupOffset});
-    rewriter.replaceOpWithNewOp<LLVM::LoadOp>(op, rewriter.getI64Type(),
-                                              slotPtr);
+    Value time =
+        LLVM::LoadOp::create(rewriter, loc, rewriter.getI64Type(), slotPtr);
+    Value flagPtr = LLVM::GEPOp::create(
+        rewriter, loc, ptrType, rewriter.getI8Type(), adaptor.getArcContext(),
+        ArrayRef<LLVM::GEPArg>{arc::kTerminateFlagOffset});
+    auto status =
+        LLVM::LoadOp::create(rewriter, loc, rewriter.getI8Type(), flagPtr);
+    auto zero =
+        LLVM::ConstantOp::create(rewriter, loc, rewriter.getI8Type(), 0);
+    auto terminated = LLVM::ICmpOp::create(
+        rewriter, loc, LLVM::ICmpPredicate::ne, status, zero);
+    auto never =
+        LLVM::ConstantOp::create(rewriter, loc, rewriter.getI64Type(), -1);
+    rewriter.replaceOpWithNewOp<LLVM::SelectOp>(op, terminated, never, time);
     return success();
   }
 };
