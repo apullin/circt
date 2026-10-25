@@ -341,7 +341,7 @@ struct OptimizeReturnOfAlloc : public OpRewritePattern<func::ReturnOp> {
           op, [&, &result = result] { result.set(copy.getSource()); });
       rewriter.replaceAllUsesWith(alloc, arg);
       rewriter.eraseOp(alloc);
-      rewriter.eraseOp(copy);
+      rewriter.replaceOp(copy, copy.getSource());
       changed = true;
     }
     return success(changed);
