@@ -301,6 +301,11 @@ static llvm::cl::opt<std::string> jitVcdFile(
         "Create a VCD trace for JIT runs and output it to the specified file"),
     llvm::cl::init(""), llvm::cl::cat(mainCategory));
 
+static llvm::cl::opt<unsigned> jitOptLevel(
+    "jit-opt-level",
+    llvm::cl::desc("LLVM optimization and code generation level for JIT (0-3)"),
+    llvm::cl::init(3), llvm::cl::cat(mainCategory));
+
 static llvm::cl::opt<std::string> jitObjectFile(
     "jit-object-file",
     llvm::cl::desc("Write the JIT-compiled object code to the specified file"),
@@ -556,6 +561,10 @@ static LogicalResult processBuffer(
 #ifdef ARCILATOR_ENABLE_JIT
   // Handle JIT execution.
   if (outputFormat == OutputRunJIT) {
+    if (jitOptLevel > 3) {
+      llvm::errs() << "--jit-opt-level must be between 0 and 3\n";
+      return failure();
+    }
     auto tsJit = ts.nest("JIT");
     if (runUntilBefore != UntilEnd || runUntilAfter != UntilEnd) {
       llvm::errs() << "full pipeline must be run for JIT execution\n";
@@ -601,10 +610,11 @@ static LogicalResult processBuffer(
                                               sharedLibs.end());
 
     mlir::ExecutionEngineOptions engineOptions;
-    engineOptions.jitCodeGenOptLevel = llvm::CodeGenOptLevel::Aggressive;
+    engineOptions.jitCodeGenOptLevel =
+        static_cast<llvm::CodeGenOptLevel>(jitOptLevel.getValue());
     std::function<llvm::Error(llvm::Module *)> transformer =
         mlir::makeOptimizingTransformer(
-            /*optLevel=*/3, /*sizeLevel=*/0,
+            /*optLevel=*/jitOptLevel, /*sizeLevel=*/0,
             /*targetMachine=*/nullptr);
     engineOptions.transformer = transformer;
     engineOptions.sharedLibPaths = sharedLibraries;
