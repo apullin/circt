@@ -9,6 +9,7 @@
 #include "circt/Dialect/Arc/ArcDialect.h"
 #include "circt/Dialect/Arc/ArcOps.h"
 #include "circt/Dialect/Arc/ArcTypes.h"
+#include "circt/Dialect/HW/HWDialect.h"
 #include "circt/Dialect/HW/HWOps.h"
 #include "mlir/Transforms/InliningUtils.h"
 
@@ -64,20 +65,7 @@ void ArcDialect::initialize() {
 /// constant value. Otherwise, it should return null on failure.
 Operation *ArcDialect::materializeConstant(OpBuilder &builder, Attribute value,
                                            Type type, Location loc) {
-  // Integer constants.
-  if (auto intType = dyn_cast<IntegerType>(type))
-    if (auto attrValue = dyn_cast<IntegerAttr>(value))
-      return hw::ConstantOp::create(builder, loc, type, attrValue);
-
-  // Parameter expressions materialize into hw.param.value.
-  auto *parentOp = builder.getBlock()->getParentOp();
-  auto curModule = dyn_cast<hw::HWModuleOp>(parentOp);
-  if (!curModule)
-    curModule = parentOp->getParentOfType<hw::HWModuleOp>();
-  if (curModule && isValidParameterExpression(value, curModule))
-    return hw::ParamValueOp::create(builder, loc, type, value);
-
-  return nullptr;
+  return hw::materializeConstant(builder, value, type, loc);
 }
 
 #include "circt/Dialect/Arc/ArcDialect.cpp.inc"
