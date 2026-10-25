@@ -626,9 +626,6 @@ static LogicalResult processBuffer(
     if (!noJitRuntime)
       bindArcRuntimeSymbols(**executionEngine);
 
-    if (!jitObjectFile.empty())
-      (*executionEngine)->dumpToObjectFile(jitObjectFile);
-
     auto expectedFunc = (*executionEngine)->lookupPacked(jitEntryPoint);
     if (!expectedFunc) {
       llvm::handleAllErrors(
@@ -638,6 +635,11 @@ static LogicalResult processBuffer(
           });
       return failure();
     }
+    // Materialize the entry first. Dumping an empty engine cache forces
+    // lookups of every original function, including internal helpers that
+    // optimization may have eliminated or that have no packed wrapper.
+    if (!jitObjectFile.empty())
+      (*executionEngine)->dumpToObjectFile(jitObjectFile);
     tsCompile.stop();
 
     auto tsExecute = tsJit.nest("Execute");
