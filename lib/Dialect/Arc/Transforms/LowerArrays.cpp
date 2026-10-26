@@ -15,9 +15,11 @@
 #include "circt/Dialect/Comb/CombOps.h"
 #include "circt/Dialect/HW/HWOps.h"
 #include "circt/Dialect/HW/HWTypes.h"
+#include "circt/Dialect/Sim/SimOps.h"
 #include "mlir/Dialect/Arith/IR/Arith.h"
 #include "mlir/Dialect/ControlFlow/Transforms/StructuralTypeConversions.h"
 #include "mlir/Dialect/Func/IR/FuncOps.h"
+#include "mlir/Dialect/SCF/IR/SCF.h"
 #include "mlir/IR/Builders.h"
 #include "mlir/IR/BuiltinOps.h"
 #include "mlir/IR/BuiltinTypes.h"
@@ -441,8 +443,145 @@ struct OptimizeReturnOfAlloc : public OpRewritePattern<func::ReturnOp> {
   }
 };
 
+/// Find state-array reads whose consumers finish before the underlying storage
+/// can change. Analyze the original value-semantics IR: array updates and call
+/// results get their own buffers during conversion, whereas array slices and
+/// reference-typed values can retain aliases and are deliberately rejected.
+struct BorrowStateArrays {
+  struct Range {
+    Value storage;
+    uint64_t offset;
+    uint64_t size;
+  };
+
+  static std::optional<Range> getRange(Value state) {
+    auto get = state.getDefiningOp<StorageGetOp>();
+    if (!get)
+      return {};
+    Range range{get.getStorage(), get.getOffset(),
+                cast<StateType>(state.getType()).getByteWidth()};
+    while (auto parent = range.storage.getDefiningOp<StorageGetOp>()) {
+      range.offset += parent.getOffset();
+      range.storage = parent.getStorage();
+    }
+    return range;
+  }
+
+  // This is lexical ordering, including conditional readers: a read in an
+  // earlier if finishes before a later sibling write, even though it does not
+  // dominate that write. Callers exclude loop-carried and escaping aliases.
+  static bool isBefore(Operation *a, Operation *b) {
+    for (auto *left = a; left; left = left->getParentOp())
+      for (auto *right = b; right; right = right->getParentOp())
+        if (left->getBlock() == right->getBlock())
+          return left != right && left->isBeforeInBlock(right);
+    return false;
+  }
+
+  bool canBorrow(StateReadOp read) {
+    auto array = dyn_cast<ArrayType>(read.getType());
+    if (!array || !isa<IntegerType>(array.getElementType()) ||
+        read.getValue().use_empty())
+      return false;
+    auto *block = read->getBlock();
+    if (!isa<ModelOp, func::FuncOp>(block->getParentOp()) ||
+        !block->getParent()->hasOneBlock())
+      return false;
+    auto range = getRange(read.getState());
+    if (!range)
+      return false;
+
+    SmallVector<Operation *> readers;
+    for (auto &use : read.getValue().getUses()) {
+      auto *user = use.getOwner();
+      // Each permitted consumer finishes reading this value at the operation
+      // itself. In particular, converted calls copy array results into sret
+      // buffers and array_inject first clones its input.
+      if (auto get = dyn_cast<ArrayGetOp>(user)) {
+        if (isa<ArrayType>(get.getType()))
+          return false;
+      } else if (auto write = dyn_cast<StateWriteOp>(user)) {
+        if (write.getValue() != read.getValue())
+          return false;
+      } else if (!isa<func::CallOp, ArrayInjectOp>(user)) {
+        return false;
+      }
+      auto *ancestor = user;
+      while (ancestor && ancestor->getBlock() != block) {
+        ancestor = ancestor->getParentOp();
+        if (!isa_and_nonnull<scf::IfOp>(ancestor))
+          return false;
+      }
+      if (!ancestor || !read->isBeforeInBlock(ancestor))
+        return false;
+      readers.push_back(user);
+    }
+
+    for (auto &top : *block) {
+      auto result = top.walk([&](Operation *op) {
+        if (isBefore(op, read) || op == read ||
+            llvm::all_of(readers,
+                         [&](auto *user) { return isBefore(user, op); }))
+          return WalkResult::advance();
+        return cannotWriteState(op, range) ? WalkResult::advance()
+                                           : WalkResult::interrupt();
+      });
+      if (result.wasInterrupted())
+        return false;
+    }
+    return true;
+  }
+
+  bool cannotWriteState(Operation *op, std::optional<Range> range) {
+    if (auto write = dyn_cast<StateWriteOp>(op)) {
+      auto written = getRange(write.getState());
+      return range && written && range->storage == written->storage &&
+             (range->offset + range->size <= written->offset ||
+              written->offset + written->size <= range->offset);
+    }
+    if (auto call = dyn_cast<func::CallOp>(op)) {
+      auto callee = SymbolTable::lookupNearestSymbolFrom<func::FuncOp>(
+          call, call.getCalleeAttr());
+      if (!callee || callee.isExternal())
+        return false;
+      auto [it, inserted] = stateFreeCallees.try_emplace(callee, false);
+      if (!inserted)
+        return it->second;
+      // Unknown/recursive calls and explicit mutable array writes are barriers.
+      // Pure hw.array operations cannot mutate their value-typed arguments.
+      auto result = callee.getBody().walk([&](Operation *nested) {
+        return cannotWriteState(nested, {}) ? WalkResult::advance()
+                                            : WalkResult::interrupt();
+      });
+      bool safe = !result.wasInterrupted();
+      stateFreeCallees[callee] = safe;
+      return safe;
+    }
+    // These operations affect fresh allocations, output streams, or runtime
+    // context fields, never the model's hardware state slots.
+    if (isa<ArrayRefAllocOp, sim::PrintFormattedProcOp, arc::TerminateOp,
+            SetNextWakeupOp>(op))
+      return true;
+    if (op->hasTrait<OpTrait::HasRecursiveMemoryEffects>())
+      return true; // The walk checks the nested effects separately.
+    if (auto effects = dyn_cast<MemoryEffectOpInterface>(op)) {
+      SmallVector<MemoryEffects::EffectInstance> instances;
+      effects.getEffects(instances);
+      return llvm::none_of(instances, [](auto &effect) {
+        return isa<MemoryEffects::Write, MemoryEffects::Free>(
+            effect.getEffect());
+      });
+    }
+    return false;
+  }
+
+  DenseMap<Operation *, bool> stateFreeCallees;
+};
+
 struct ConvertStateRead : public OpConversionPattern<StateReadOp> {
-  using OpConversionPattern<StateReadOp>::OpConversionPattern;
+  ConvertStateRead(TypeConverter &converter, MLIRContext *context,
+                   const llvm::SmallDenseSet<Operation *> &borrowable)
+      : OpConversionPattern(converter, context), borrowable(borrowable) {}
 
   LogicalResult
   matchAndRewrite(StateReadOp op, OpAdaptor adaptor,
@@ -452,11 +591,16 @@ struct ConvertStateRead : public OpConversionPattern<StateReadOp> {
     if (failed(result))
       return failure();
 
-    // For correctness we need to copy the read state into a local array.
+    // Borrow only reads proven safe in the original value-semantics IR.
     Value resultValue = result.value()->getResult(0);
-    rewriter.replaceOp(op, cloneArrayRef(resultValue, rewriter, op.getLoc()));
+    rewriter.replaceOp(op,
+                       borrowable.contains(op)
+                           ? resultValue
+                           : cloneArrayRef(resultValue, rewriter, op.getLoc()));
     return success();
   }
+
+  const llvm::SmallDenseSet<Operation *> &borrowable;
 };
 
 template <typename Op>
@@ -488,6 +632,12 @@ void LowerArraysPass::runOnOperation() {
   TypeConverter converter;
   ConversionTarget target(getContext());
   RewritePatternSet patterns(&getContext());
+  BorrowStateArrays borrowAnalysis;
+  llvm::SmallDenseSet<Operation *> borrowable;
+  getOperation().walk([&](StateReadOp read) {
+    if (borrowAnalysis.canBorrow(read))
+      borrowable.insert(read);
+  });
 
   converter.addConversion([](Type type) { return type; });
   converter.addConversion([&converter](ArrayType type) -> Type {
@@ -540,13 +690,14 @@ void LowerArraysPass::runOnOperation() {
     return ArrayRefToArrayOp::create(b, loc, type, values.front());
   });
 
-  patterns.add<ConvertFunc, ConvertReturn, ConvertCall,
-               ConvertAggregateConstant, ConvertArrayGet, ConvertArrayInject,
-               ConvertArraySlice, ConvertArrayConcat, ConvertArrayCreate,
-               ConvertStorageGet, ConvertMux, ConvertAllocState,
-               ConvertStateRead, ConvertStateWrite, ConvertRootInput,
-               ConvertRootOutput, ConvertUnrealizedConversionCast>(
-      converter, &getContext());
+  patterns
+      .add<ConvertFunc, ConvertReturn, ConvertCall, ConvertAggregateConstant,
+           ConvertArrayGet, ConvertArrayInject, ConvertArraySlice,
+           ConvertArrayConcat, ConvertArrayCreate, ConvertStorageGet,
+           ConvertMux, ConvertAllocState, ConvertStateWrite, ConvertRootInput,
+           ConvertRootOutput, ConvertUnrealizedConversionCast>(converter,
+                                                               &getContext());
+  patterns.add<ConvertStateRead>(converter, &getContext(), borrowable);
   cf::populateCFStructuralTypeConversionsAndLegality(converter, patterns,
                                                      target);
 
