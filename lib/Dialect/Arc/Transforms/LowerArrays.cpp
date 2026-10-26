@@ -15,7 +15,9 @@
 #include "circt/Dialect/Comb/CombOps.h"
 #include "circt/Dialect/HW/HWOps.h"
 #include "circt/Dialect/HW/HWTypes.h"
+#include "mlir/Analysis/Liveness.h"
 #include "mlir/Dialect/Arith/IR/Arith.h"
+#include "mlir/Dialect/ControlFlow/IR/ControlFlowOps.h"
 #include "mlir/Dialect/ControlFlow/Transforms/StructuralTypeConversions.h"
 #include "mlir/Dialect/Func/IR/FuncOps.h"
 #include "mlir/IR/Builders.h"
@@ -25,6 +27,7 @@
 #include "mlir/IR/PatternMatch.h"
 #include "mlir/IR/RegionGraphTraits.h"
 #include "mlir/IR/Value.h"
+#include "mlir/Interfaces/ControlFlowInterfaces.h"
 #include "mlir/Support/LLVM.h"
 #include "mlir/Support/LogicalResult.h"
 #include "mlir/Transforms/DialectConversion.h"
@@ -90,8 +93,82 @@ Value cloneArrayRef(Value value, OpBuilder &builder, Location loc) {
   return ArrayRefCopyOp::create(builder, loc, newAlloc, value);
 }
 
+using LoopBorrowInfo = DenseMap<Operation *, llvm::SmallDenseSet<unsigned>>;
+
 struct ConvertFunc : public OpConversionPattern<func::FuncOp> {
-  using OpConversionPattern::OpConversionPattern;
+  ConvertFunc(TypeConverter &converter, MLIRContext *context,
+              const LoopBorrowInfo &borrowedLoopArrays)
+      : OpConversionPattern(converter, context),
+        borrowedLoopArrays(borrowedLoopArrays) {}
+
+  /// A loop with one array-carried value can keep its incoming reference when
+  /// each backedge either preserves it or injects into it after its final read.
+  /// The inject still clones on write; if its allocation held the previous
+  /// iteration, memmove reads that value before the element is overwritten.
+  /// Keep staging for parallel transfers, lagged reads, views and other array
+  /// producers whose writes might precede their reads.
+  static bool canBorrowLoopArray(BlockArgument argument,
+                                 const SmallPtrSetImpl<Block *> &blocks,
+                                 const Liveness &liveness) {
+    auto array = cast<ArrayType>(argument.getType());
+    if (!isa<IntegerType>(array.getElementType()))
+      return false;
+    for (auto &use : argument.getUses()) {
+      auto *user = use.getOwner();
+      if (user->getParentRegion() != argument.getOwner()->getParent())
+        return false;
+      if (!isa<ArrayGetOp, ArrayInjectOp, func::CallOp, func::ReturnOp,
+               StateWriteOp, cf::BranchOp, cf::CondBranchOp, cf::SwitchOp>(
+              user))
+        return false;
+    }
+    for (auto *pred : argument.getOwner()->getPredecessors()) {
+      if (!blocks.contains(pred))
+        continue;
+      auto branch = dyn_cast<BranchOpInterface>(pred->getTerminator());
+      if (!branch)
+        return false;
+      for (unsigned index = 0; index < branch->getNumSuccessors(); ++index) {
+        if (branch->getSuccessor(index) != argument.getOwner())
+          continue;
+        auto operands = branch.getSuccessorOperands(index);
+        if (operands.getProducedOperandCount())
+          return false;
+        auto source = operands.getForwardedOperands()[argument.getArgNumber()];
+        if (source == argument)
+          continue;
+        auto inject = source.getDefiningOp<ArrayInjectOp>();
+        if (!inject || inject.getInput() != argument || !source.hasOneUse() ||
+            !liveness.isDeadAfter(argument, inject))
+          return false;
+      }
+    }
+    return true;
+  }
+
+  static void collectBorrowedLoops(func::FuncOp op,
+                                   LoopBorrowInfo &borrowedLoopArrays) {
+    if (op.isPrivate() && !op.isExternal()) {
+      std::optional<Liveness> liveness;
+      for (auto scc = llvm::scc_begin(&op.getBody()); !scc.isAtEnd(); ++scc) {
+        if (!scc.hasCycle())
+          continue;
+        SmallVector<BlockArgument> arrays;
+        SmallPtrSet<Block *, 8> blocks(scc->begin(), scc->end());
+        for (auto *block : *scc)
+          for (auto argument : block->getArguments())
+            if (isa<ArrayType>(argument.getType()))
+              arrays.push_back(argument);
+        if (arrays.size() != 1)
+          continue;
+        if (!liveness)
+          liveness.emplace(op);
+        if (canBorrowLoopArray(arrays.front(), blocks, *liveness))
+          borrowedLoopArrays[op].insert(std::distance(
+              op.getBody().begin(), arrays.front().getOwner()->getIterator()));
+      }
+    }
+  }
 
   LogicalResult
   matchAndRewrite(func::FuncOp op, OpAdaptor adaptor,
@@ -145,9 +222,12 @@ struct ConvertFunc : public OpConversionPattern<func::FuncOp> {
       if (scc.hasCycle())
         cyclicBlocks.insert(scc->begin(), scc->end());
 
+    auto borrowed = borrowedLoopArrays.find(op);
     assert(valueArrayArguments.size() == op.getBody().getBlocks().size());
     for (auto [index, block] : llvm::enumerate(op.getBody())) {
-      if (!cyclicBlocks.contains(&block))
+      if (!cyclicBlocks.contains(&block) ||
+          (borrowed != borrowedLoopArrays.end() &&
+           borrowed->second.contains(index)))
         continue;
       OpBuilder::InsertionGuard guard(rewriter);
       rewriter.setInsertionPointToStart(&block);
@@ -176,6 +256,8 @@ struct ConvertFunc : public OpConversionPattern<func::FuncOp> {
 
     return success();
   }
+
+  const LoopBorrowInfo &borrowedLoopArrays;
 };
 
 struct ConvertReturn : public OpConversionPattern<func::ReturnOp> {
@@ -488,6 +570,10 @@ void LowerArraysPass::runOnOperation() {
   TypeConverter converter;
   ConversionTarget target(getContext());
   RewritePatternSet patterns(&getContext());
+  LoopBorrowInfo borrowedLoopArrays;
+  getOperation().walk([&](func::FuncOp func) {
+    ConvertFunc::collectBorrowedLoops(func, borrowedLoopArrays);
+  });
 
   converter.addConversion([](Type type) { return type; });
   converter.addConversion([&converter](ArrayType type) -> Type {
@@ -540,13 +626,13 @@ void LowerArraysPass::runOnOperation() {
     return ArrayRefToArrayOp::create(b, loc, type, values.front());
   });
 
-  patterns.add<ConvertFunc, ConvertReturn, ConvertCall,
-               ConvertAggregateConstant, ConvertArrayGet, ConvertArrayInject,
-               ConvertArraySlice, ConvertArrayConcat, ConvertArrayCreate,
-               ConvertStorageGet, ConvertMux, ConvertAllocState,
-               ConvertStateRead, ConvertStateWrite, ConvertRootInput,
-               ConvertRootOutput, ConvertUnrealizedConversionCast>(
-      converter, &getContext());
+  patterns.add<ConvertReturn, ConvertCall, ConvertAggregateConstant,
+               ConvertArrayGet, ConvertArrayInject, ConvertArraySlice,
+               ConvertArrayConcat, ConvertArrayCreate, ConvertStorageGet,
+               ConvertMux, ConvertAllocState, ConvertStateRead,
+               ConvertStateWrite, ConvertRootInput, ConvertRootOutput,
+               ConvertUnrealizedConversionCast>(converter, &getContext());
+  patterns.add<ConvertFunc>(converter, &getContext(), borrowedLoopArrays);
   cf::populateCFStructuralTypeConversionsAndLegality(converter, patterns,
                                                      target);
 
