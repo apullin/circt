@@ -18,17 +18,21 @@
 #include "mlir/Dialect/Arith/IR/Arith.h"
 #include "mlir/Dialect/ControlFlow/Transforms/StructuralTypeConversions.h"
 #include "mlir/Dialect/Func/IR/FuncOps.h"
+#include "mlir/Dialect/SCF/IR/SCF.h"
 #include "mlir/IR/Builders.h"
 #include "mlir/IR/BuiltinOps.h"
 #include "mlir/IR/BuiltinTypes.h"
+#include "mlir/IR/Dominance.h"
 #include "mlir/IR/Location.h"
 #include "mlir/IR/PatternMatch.h"
 #include "mlir/IR/RegionGraphTraits.h"
 #include "mlir/IR/Value.h"
+#include "mlir/Interfaces/SideEffectInterfaces.h"
 #include "mlir/Support/LLVM.h"
 #include "mlir/Support/LogicalResult.h"
 #include "mlir/Transforms/DialectConversion.h"
 #include "mlir/Transforms/GreedyPatternRewriteDriver.h"
+#include "llvm/ADT/DenseSet.h"
 #include "llvm/ADT/SCCIterator.h"
 
 #define DEBUG_TYPE "arc-lower-arrays"
@@ -374,6 +378,121 @@ struct ConvertMux : public OpConversionPattern<comb::MuxOp> {
   }
 };
 
+/// Do not snapshot a state array on activations where no consumer can read it.
+/// Keep the copy at its original position, before any intervening state writes;
+/// merely sinking it into the consumer would lose the required old value.
+struct GuardStateArrayCopy : public OpRewritePattern<ArrayRefCopyOp> {
+  using OpRewritePattern::OpRewritePattern;
+
+  LogicalResult matchAndRewrite(ArrayRefCopyOp op,
+                                PatternRewriter &rewriter) const override {
+    if (op.getOutput().use_empty() ||
+        !op.getSource().getDefiningOp<StateReadOp>())
+      return failure();
+    auto temporary = op.getInput().getDefiningOp<ArrayRefAllocOp>();
+    if (!temporary || temporary.getInit() || !temporary.getOutput().hasOneUse())
+      return failure();
+    llvm::SmallDenseSet<Value> visiting;
+    if (!isReadOnlyArray(op.getOutput(), visiting))
+      return failure();
+
+    scf::IfOp consumer;
+    for (auto *user : op.getOutput().getUsers()) {
+      auto *ancestor = user;
+      while (ancestor && ancestor->getBlock() != op->getBlock())
+        ancestor = ancestor->getParentOp();
+      auto ifOp = dyn_cast_or_null<scf::IfOp>(ancestor);
+      if (!ifOp || !op->isBeforeInBlock(ifOp) ||
+          !ifOp.getThenRegion().isAncestor(user->getParentRegion()) ||
+          (consumer && consumer != ifOp))
+        return failure();
+      consumer = ifOp;
+    }
+
+    DominanceInfo dominance(op->getParentOp());
+    SmallVector<Operation *> hoisted;
+    SmallPtrSet<Operation *, 8> visited;
+    if (!makeAvailable(consumer.getCondition(), op, dominance, visited,
+                       hoisted))
+      return failure();
+
+    for (auto *definition : hoisted)
+      rewriter.moveOpBefore(definition, op);
+    rewriter.setInsertionPoint(op);
+    auto guard = scf::IfOp::create(rewriter, op.getLoc(),
+                                   consumer.getCondition(), false);
+    rewriter.replaceAllUsesWith(op.getOutput(), temporary.getOutput());
+    rewriter.moveOpBefore(op, guard.thenYield());
+    return success();
+  }
+
+  /// Reject escaping aliases: an indirect reader could observe this buffer on
+  /// a later activation where its syntactic guard is false. Known by-value
+  /// readers and calls with corresponding read-only arguments do not escape.
+  static bool isReadOnlyArray(Value value,
+                              llvm::SmallDenseSet<Value> &visiting) {
+    if (!visiting.insert(value).second)
+      return false;
+    for (auto &use : value.getUses()) {
+      auto *user = use.getOwner();
+      if (isa<ArrayRefGetOp, ArrayRefToArrayOp>(user))
+        continue;
+      if (auto copy = dyn_cast<ArrayRefCopyOp>(user)) {
+        if (use.getOperandNumber() == 1)
+          continue;
+      } else if (auto write = dyn_cast<StateWriteOp>(user)) {
+        if (write.getValue() == value)
+          continue;
+      } else if (auto call = dyn_cast<func::CallOp>(user)) {
+        auto callee = SymbolTable::lookupNearestSymbolFrom<func::FuncOp>(
+            call, call.getCalleeAttr());
+        auto index = use.getOperandNumber();
+        if (callee && !callee.isExternal() &&
+            index < callee.getNumArguments() &&
+            isReadOnlyArray(callee.getArgument(index), visiting))
+          continue;
+      }
+      visiting.erase(value);
+      return false;
+    }
+    visiting.erase(value);
+    return true;
+  }
+
+  static bool makeAvailable(Value value, Operation *before,
+                            DominanceInfo &dominance,
+                            SmallPtrSetImpl<Operation *> &visited,
+                            SmallVectorImpl<Operation *> &hoisted) {
+    if (dominance.dominates(value, before))
+      return true;
+    auto *definition = value.getDefiningOp();
+    if (!definition || definition->getBlock() != before->getBlock() ||
+        !before->isBeforeInBlock(definition) || definition->getNumRegions())
+      return false;
+    if (!visited.insert(definition).second)
+      return true;
+
+    if (auto read = dyn_cast<StateReadOp>(definition)) {
+      // A scalar old-state predicate can move past other reads, but never past
+      // a write or an operation with unknown effects.
+      if (!read.getType().isInteger(1))
+        return false;
+      for (auto *between = before->getNextNode(); between != definition;
+           between = between->getNextNode())
+        if (!isa<StateReadOp, ArrayRefAllocOp>(between) &&
+            !isMemoryEffectFree(between))
+          return false;
+    } else if (!isMemoryEffectFree(definition) || !isSpeculatable(definition)) {
+      return false;
+    }
+    for (auto operand : definition->getOperands())
+      if (!makeAvailable(operand, before, dominance, visited, hoisted))
+        return false;
+    hoisted.push_back(definition);
+    return true;
+  }
+};
+
 // Identifies a return of an ArrayRef that is defined by an ArrayRefAllocOp,
 // and replaces the alloc with the sret buffer. Also removes the copy.
 struct OptimizeReturnOfAlloc : public OpRewritePattern<func::ReturnOp> {
@@ -559,7 +678,8 @@ void LowerArraysPass::runOnOperation() {
 
   // Apply some cleanup patterns to optimize away ArrayRefAllocOps.
   RewritePatternSet cleanupPatterns(&getContext());
-  cleanupPatterns.add<OptimizeReturnOfAlloc>(&getContext());
+  cleanupPatterns.add<GuardStateArrayCopy, OptimizeReturnOfAlloc>(
+      &getContext());
   if (failed(
           applyPatternsGreedily(getOperation(), std::move(cleanupPatterns)))) {
     return signalPassFailure();
