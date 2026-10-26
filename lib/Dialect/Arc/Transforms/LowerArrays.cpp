@@ -578,6 +578,99 @@ struct ConvertStateRead : public OpConversionPattern<StateReadOp> {
   }
 };
 
+/// A private callee need not fill an array result on paths where all callers
+/// ignore that payload. Derive the condition from a boolean result guarding
+/// every non-escaping reader, and keep the caller-owned sret buffer private.
+void guardUnusedArrayReturns(Operation *root) {
+  IRRewriter rewriter(root->getContext());
+  root->walk([&](func::FuncOp func) {
+    if (!func.isPrivate() || func.isExternal())
+      return;
+    auto uses = SymbolTable::getSymbolUses(func, func->getParentOp());
+    if (!uses || uses->empty())
+      return;
+    SmallVector<func::CallOp> calls;
+    for (auto &use : *uses) {
+      auto call = dyn_cast<func::CallOp>(use.getUser());
+      if (!call || call.getCallee() != func.getSymName())
+        return;
+      calls.push_back(call);
+    }
+
+    unsigned sretIndex = 0;
+    for (auto [index, type] : llvm::enumerate(func.getResultTypes())) {
+      if (!isa<ArrayRefType>(type))
+        continue;
+      auto argumentIndex = sretIndex++;
+      if (argumentIndex >= func.getNumArguments() ||
+          func.getArgument(argumentIndex).getType() != type)
+        continue;
+      Value buffer = func.getArgument(argumentIndex);
+      if (!llvm::all_of(buffer.getUses(), [](OpOperand &use) {
+            return isa<ArrayRefCopyOp>(use.getOwner()) &&
+                   use.getOperandNumber() == 0;
+          }))
+        continue;
+
+      std::optional<unsigned> flagIndex;
+      bool safe = llvm::all_of(calls, [&](func::CallOp call) {
+        auto allocation =
+            call.getOperand(argumentIndex).getDefiningOp<ArrayRefAllocOp>();
+        if (!allocation || allocation.getInit() ||
+            !allocation.getOutput().hasOneUse())
+          return false;
+        Value result = call.getResult(index);
+        llvm::SmallDenseSet<Value> visiting;
+        if (result.use_empty() ||
+            !GuardStateArrayCopy::isReadOnlyArray(result, visiting))
+          return false;
+        for (auto *user : result.getUsers()) {
+          std::optional<unsigned> guardIndex;
+          for (auto *parent = user->getParentOp(); parent;
+               parent = parent->getParentOp()) {
+            auto guard = dyn_cast<scf::IfOp>(parent);
+            if (!guard ||
+                !guard.getThenRegion().isAncestor(user->getParentRegion()))
+              continue;
+            auto condition = dyn_cast<OpResult>(guard.getCondition());
+            if (condition && condition.getOwner() == call) {
+              guardIndex = condition.getResultNumber();
+              break;
+            }
+          }
+          if (!guardIndex || (flagIndex && flagIndex != guardIndex))
+            return false;
+          flagIndex = guardIndex;
+        }
+        return true;
+      });
+      if (!safe || !flagIndex)
+        continue;
+
+      DominanceInfo dominance(func);
+      SmallVector<std::pair<func::ReturnOp, ArrayRefCopyOp>> returns;
+      func.walk([&](func::ReturnOp ret) {
+        auto copy = ret.getOperand(index).getDefiningOp<ArrayRefCopyOp>();
+        if (copy && copy.getInput() == buffer && copy.getOutput().hasOneUse() &&
+            copy->getBlock() == ret->getBlock() &&
+            dominance.dominates(ret.getOperand(*flagIndex), copy))
+          returns.emplace_back(ret, copy);
+        else
+          safe = false;
+      });
+      if (!safe)
+        continue;
+      for (auto [ret, copy] : returns) {
+        rewriter.setInsertionPoint(copy);
+        auto guard = scf::IfOp::create(rewriter, copy.getLoc(),
+                                       ret.getOperand(*flagIndex), false);
+        rewriter.modifyOpInPlace(ret, [&] { ret.setOperand(index, buffer); });
+        rewriter.moveOpBefore(copy, guard.thenYield());
+      }
+    }
+  });
+}
+
 template <typename Op>
 struct ConvertTrivially : public OpConversionPattern<Op> {
   using OpConversionPattern<Op>::OpConversionPattern;
@@ -675,6 +768,8 @@ void LowerArraysPass::runOnOperation() {
                                     config))) {
     return signalPassFailure();
   }
+
+  guardUnusedArrayReturns(getOperation());
 
   // Apply some cleanup patterns to optimize away ArrayRefAllocOps.
   RewritePatternSet cleanupPatterns(&getContext());
