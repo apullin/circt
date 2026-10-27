@@ -183,7 +183,7 @@ void InlineArcsAnalysis::analyze(ArrayRef<Region *> regionsWithCalls,
     auto arcName = arc.getSymNameAttr();
     arcMap[arcName] = arc;
     numOpsInArc[arcName] = 0;
-    arc->walk([&](Operation *op) {
+    arc.getBody().walk([&](Operation *op) {
       if (!op->hasTrait<OpTrait::ConstantLike>() && !isa<OutputOp>(op))
         ++numOpsInArc[arcName];
       if (isa<mlir::CallOpInterface>(op))
