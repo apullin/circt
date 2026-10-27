@@ -38,6 +38,7 @@
 #include "mlir/Dialect/UB/IR/UBOps.h"
 #include "mlir/IR/AsmState.h"
 #include "mlir/IR/BuiltinOps.h"
+#include "mlir/IR/Verifier.h"
 #include "mlir/Parser/Parser.h"
 #include "mlir/Pass/PassManager.h"
 #include "mlir/Support/FileUtilities.h"
@@ -93,6 +94,11 @@ struct CLOptions {
   cl::opt<bool> emitBytecode{
       "emit-bytecode", cl::desc("Emit bytecode when generating MLIR output"),
       cl::init(false), cl::cat(cat)};
+
+  cl::opt<bool> verifyEach{
+      "verify-each",
+      cl::desc("Run the verifier after each transformation pass"),
+      cl::init(true), cl::cat(cat)};
 
   cl::opt<bool> force{"f", cl::desc("Enable binary output on terminals"),
                       cl::init(false), cl::cat(cat)};
@@ -441,7 +447,7 @@ static LogicalResult executeWithSources(MLIRContext *context,
   // options.
   if (opts.loweringMode != LoweringMode::OnlyImport) {
     PassManager pm(context);
-    pm.enableVerifier(true);
+    pm.enableVerifier(opts.verifyEach);
     pm.enableTiming(ts);
     if (opts.verbosePassExecutions)
       pm.addInstrumentation(
@@ -451,6 +457,14 @@ static LogicalResult executeWithSources(MLIRContext *context,
       return failure();
     populatePasses(pm);
     if (failed(pm.run(module.get())))
+      return failure();
+  }
+
+  // Disabling the repeated checks must still validate the final module before
+  // emitting it, including the import-only path which has no pass manager.
+  if (!opts.verifyEach) {
+    auto verifierTimer = ts.nest("Verify final IR");
+    if (failed(verify(module.get())))
       return failure();
   }
 
