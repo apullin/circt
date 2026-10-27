@@ -91,11 +91,27 @@ static Location convertLocation(MLIRContext *context,
 }
 
 Location Context::convertLocation(slang::SourceLocation loc) {
-  return ::convertLocation(getContext(), sourceManager, loc);
+  auto key = std::make_pair(loc.buffer().getId(), loc.offset());
+  auto found = sourceLocations.find(key);
+  if (found != sourceLocations.end())
+    return found->second;
+  auto converted = ::convertLocation(getContext(), sourceManager, loc);
+  sourceLocations.try_emplace(key, converted);
+  return converted;
 }
 
 Location Context::convertLocation(slang::SourceRange range) {
-  return ::convertLocation(getContext(), sourceManager, range);
+  auto start = range.start();
+  auto end = range.end();
+  auto key =
+      std::make_pair(std::make_pair(start.buffer().getId(), start.offset()),
+                     std::make_pair(end.buffer().getId(), end.offset()));
+  auto found = sourceRanges.find(key);
+  if (found != sourceRanges.end())
+    return found->second;
+  auto converted = ::convertLocation(getContext(), sourceManager, range);
+  sourceRanges.try_emplace(key, converted);
+  return converted;
 }
 
 namespace {

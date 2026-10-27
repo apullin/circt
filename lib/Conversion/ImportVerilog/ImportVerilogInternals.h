@@ -24,6 +24,7 @@
 #include "slang/ast/ASTVisitor.h"
 #include "slang/ast/TimingControl.h"
 #include "slang/text/SourceManager.h"
+#include "llvm/ADT/DenseMap.h"
 #include "llvm/ADT/ScopedHashTable.h"
 #include "llvm/Support/Debug.h"
 #include <map>
@@ -696,6 +697,15 @@ struct Context {
   SmallVector<PendingMonitor> pendingMonitors;
 
 private:
+  // Source buffers and line mappings are stable during AST conversion. Keep
+  // these caches local to this import, including buffer IDs in every key so
+  // that identical offsets in different files or macro expansions stay
+  // distinct.
+  using SourceLocationKey = std::pair<uint32_t, size_t>;
+  DenseMap<SourceLocationKey, Location> sourceLocations;
+  DenseMap<std::pair<SourceLocationKey, SourceLocationKey>, Location>
+      sourceRanges;
+
   /// Helper function to extract the commonalities in lowering of functions and
   /// methods
   FunctionLowering *
