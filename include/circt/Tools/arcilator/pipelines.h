@@ -91,6 +91,11 @@ struct ArcStateLoweringOptions
     : mlir::PassPipelineOptions<ArcStateLoweringOptions> {
   Option<bool> shouldInline{*this, "inline", llvm::cl::desc("Inline arcs"),
                             llvm::cl::init(true)};
+  Option<bool> inferInputStability{
+      *this, "infer-input-stability",
+      llvm::cl::desc(
+          "Infer whether unchanged inputs permit skipping evaluation"),
+      llvm::cl::init(false)};
 };
 void populateArcStateLoweringPipeline(
     mlir::OpPassManager &pm, const ArcStateLoweringOptions &options = {});

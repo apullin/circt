@@ -39,14 +39,20 @@ struct ModelInfo {
   llvm::SmallVector<StateInfo> states;
   mlir::FlatSymbolRefAttr initialFnSym;
   mlir::FlatSymbolRefAttr finalFnSym;
+  /// With inputs held fixed, another evaluation has no further state changes
+  /// or observable effects. The caller must only modify input storage and
+  /// still invoke the initializer/finalizer. Instrumentation invalidates this.
+  bool canSkipUnchangedInputs;
 
   ModelInfo(std::string name, size_t numStateBytes,
             llvm::SmallVector<StateInfo> states,
             mlir::FlatSymbolRefAttr initialFnSym,
-            mlir::FlatSymbolRefAttr finalFnSym)
+            mlir::FlatSymbolRefAttr finalFnSym,
+            bool canSkipUnchangedInputs = false)
       : name(std::move(name)), numStateBytes(numStateBytes),
         states(std::move(states)), initialFnSym(initialFnSym),
-        finalFnSym(finalFnSym) {}
+        finalFnSym(finalFnSym), canSkipUnchangedInputs(canSkipUnchangedInputs) {
+  }
 };
 
 struct ModelInfoAnalysis {

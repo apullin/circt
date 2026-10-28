@@ -113,7 +113,9 @@ void circt::populateArcOptimizationPipeline(
 
 void circt::populateArcStateLoweringPipeline(
     OpPassManager &pm, const ArcStateLoweringOptions &options) {
-  pm.addPass(arc::createLowerStatePass());
+  arc::LowerStatePassOptions stateOptions;
+  stateOptions.inferInputStability = options.inferInputStability;
+  pm.addPass(arc::createLowerStatePass(stateOptions));
 
   // TODO: LowerClocksToFuncsPass might not properly consider scf.if operations
   // (or nested regions in general) and thus errors out when muxes are also

@@ -617,12 +617,18 @@ LogicalResult RuntimeModelContext::lowerInstance(SimInstantiateOp &instance) {
 }
 
 void InsertRuntimePass::runOnOperation() {
+  // Runtime tracing/observability makes evaluation itself observable.
+  for (auto model : getOperation().getOps<ModelOp>())
+    model->removeAttr("arc.input_stable");
+
   // Construct the global context and collect information on all
   // models and instances
   auto &modelInfo = getAnalysis<ModelInfoAnalysis>();
   auto globalContext = std::make_unique<GlobalRuntimeContext>(getOperation());
-  for (auto &[mOp, mInfo] : modelInfo.infoMap)
+  for (auto &[mOp, mInfo] : modelInfo.infoMap) {
+    mInfo.canSkipUnchangedInputs = false;
     globalContext->addModel(mOp, mInfo);
+  }
   if (failed(globalContext->buildRuntimeModelOps()) ||
       failed(globalContext->buildTraceInstrumentation()) ||
       failed(globalContext->collectInstances())) {

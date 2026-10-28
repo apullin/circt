@@ -145,6 +145,11 @@ static llvm::cl::opt<bool> shouldInline("inline", llvm::cl::desc("Inline arcs"),
                                         llvm::cl::init(true),
                                         llvm::cl::cat(mainCategory));
 
+static llvm::cl::opt<bool> inferInputStability(
+    "infer-input-stability",
+    llvm::cl::desc("Infer whether unchanged inputs permit skipping evaluation"),
+    llvm::cl::init(false), llvm::cl::cat(mainCategory));
+
 static llvm::cl::opt<bool> shouldDedup("dedup",
                                        llvm::cl::desc("Deduplicate arcs"),
                                        llvm::cl::init(true),
@@ -422,6 +427,7 @@ static void populateHwModuleToArcPipeline(PassManager &pm) {
 
   ArcStateLoweringOptions loweringOpt;
   loweringOpt.shouldInline = shouldInline;
+  loweringOpt.inferInputStability = inferInputStability;
   populateArcStateLoweringPipeline(pm, loweringOpt);
 
   // Allocate states.
@@ -469,6 +475,10 @@ static LogicalResult addDataLayoutAttribute(ModuleOp moduleOp) {
 static LogicalResult processBuffer(
     MLIRContext &context, TimingScope &ts, llvm::SourceMgr &sourceMgr,
     std::optional<std::unique_ptr<llvm::ToolOutputFile>> &outputFile) {
+  if (inferInputStability && !noRuntime) {
+    llvm::errs() << "--infer-input-stability requires --no-runtime\n";
+    return failure();
+  }
   mlir::OwningOpRef<mlir::ModuleOp> module;
   {
     auto parserTimer = ts.nest("Parse MLIR input");

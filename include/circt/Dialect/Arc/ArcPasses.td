@@ -252,6 +252,10 @@ def LowerLUT : Pass<"arc-lower-lut", "arc::DefineOp"> {
 
 def LowerStatePass : Pass<"arc-lower-state", "mlir::ModuleOp"> {
   let summary = "Split state into read and write ops grouped by clock tree";
+  let options = [
+    Option<"inferInputStability", "infer-input-stability", "bool", "false",
+           "Infer whether unchanged inputs permit skipping model evaluation">
+  ];
   let dependentDialects = [
     "arc::ArcDialect",
     "comb::CombDialect",

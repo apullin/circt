@@ -133,9 +133,10 @@ LogicalResult circt::arc::collectModels(mlir::ModuleOp module,
       return failure();
     llvm::stable_sort(states,
                       [](auto &a, auto &b) { return a.offset < b.offset; });
-    models.emplace_back(std::string(modelOp.getName()),
-                        *modelOp.getStorageBytes(), std::move(states),
-                        modelOp.getInitialFnAttr(), modelOp.getFinalFnAttr());
+    models.emplace_back(
+        std::string(modelOp.getName()), *modelOp.getStorageBytes(),
+        std::move(states), modelOp.getInitialFnAttr(), modelOp.getFinalFnAttr(),
+        bool(modelOp->getAttrOfType<UnitAttr>("arc.input_stable")));
   }
 
   return success();
@@ -184,6 +185,8 @@ void circt::arc::serializeModelInfoToJson(llvm::raw_ostream &outputStream,
             });
           }
         });
+        if (model.canSkipUnchangedInputs)
+          json.attribute("canSkipUnchangedInputs", true);
       });
     }
   });
@@ -207,8 +210,9 @@ circt::arc::ModelInfoAnalysis::ModelInfoAnalysis(Operation *container) {
                       [](auto &a, auto &b) { return a.offset < b.offset; });
     assert(modelOp.getStorageBytes().has_value() &&
            "Expected size of storage to be known");
-    infoMap.try_emplace(modelOp, std::string(modelOp.getName()),
-                        *modelOp.getStorageBytes(), std::move(states),
-                        modelOp.getInitialFnAttr(), modelOp.getFinalFnAttr());
+    infoMap.try_emplace(
+        modelOp, std::string(modelOp.getName()), *modelOp.getStorageBytes(),
+        std::move(states), modelOp.getInitialFnAttr(), modelOp.getFinalFnAttr(),
+        bool(modelOp->getAttrOfType<UnitAttr>("arc.input_stable")));
   }
 }

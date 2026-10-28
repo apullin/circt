@@ -45,6 +45,92 @@ using namespace mlir;
 using llvm::SmallDenseSet;
 
 namespace {
+/// Prove a deliberately small class of input-idempotent hardware models.
+/// All persistent updates must be clocked by module inputs. In particular,
+/// derived clocks, procedural processes, memories and foreign/time-dependent
+/// operations are not covered by this proof.
+class InputStabilityAnalysis {
+public:
+  InputStabilityAnalysis(HWModuleOp module, SymbolTable &symbols)
+      : module(module), symbols(symbols) {}
+
+  bool check() {
+    auto scalar = [](Type type) {
+      return isa<IntegerType, seq::ClockType>(type);
+    };
+    if (!llvm::all_of(module.getBodyBlock()->getArgumentTypes(), scalar))
+      return false;
+    for (Operation &op : module.getOps()) {
+      if (auto state = dyn_cast<StateOp>(op)) {
+        if (state.getLatency() != 1 || !isInputOrConstant(state.getClock()) ||
+            !llvm::all_of(state.getResultTypes(), scalar) ||
+            !isPureArc(state.getArcAttr()))
+          return false;
+      } else if (auto output = dyn_cast<hw::OutputOp>(op)) {
+        if (!llvm::all_of(output.getOperandTypes(), scalar))
+          return false;
+      } else if (!isPure(&op)) {
+        return false;
+      }
+    }
+    return true;
+  }
+
+private:
+  bool isInputOrConstant(Value value) {
+    if (!value)
+      return false;
+    while (true) {
+      if (auto cast = value.getDefiningOp<seq::ToClockOp>())
+        value = cast.getInput();
+      else if (auto cast = value.getDefiningOp<seq::FromClockOp>())
+        value = cast.getInput();
+      else
+        break;
+    }
+    if (auto arg = dyn_cast<BlockArgument>(value))
+      return arg.getOwner() == module.getBodyBlock();
+    return matchPattern(value, m_Constant()) ||
+           bool(value.getDefiningOp<seq::ConstClockOp>());
+  }
+
+  bool isPureArc(FlatSymbolRefAttr symbol) {
+    auto arc = symbols.lookup<DefineOp>(symbol.getValue());
+    if (!arc)
+      return false;
+    auto result = pureArcs.try_emplace(arc.getOperation(), false);
+    if (!result.second)
+      return result.first->second;
+    // Leave the cached result false during recursion: cycles are not proved.
+    for (Operation &op : arc.getBodyBlock())
+      if (!isa<arc::OutputOp>(op) && !isPure(&op))
+        return false;
+    pureArcs[arc.getOperation()] = true;
+    return true;
+  }
+
+  bool isPure(Operation *op) {
+    if (auto call = dyn_cast<CallOp>(op))
+      return isPureArc(call.getArcAttr());
+    if (isa<seq::ToClockOp, seq::FromClockOp, seq::ConstClockOp>(op))
+      return true;
+    StringRef dialect = op->getName().getDialectNamespace();
+    if (dialect == "arith" &&
+        (!llvm::all_of(op->getOperandTypes(),
+                       [](Type type) { return type.isIntOrIndex(); }) ||
+         !llvm::all_of(op->getResultTypes(),
+                       [](Type type) { return type.isIntOrIndex(); })))
+      return false;
+    return (dialect == "comb" || dialect == "hw" || dialect == "arith") &&
+           !isa<hw::InstanceOp>(op) && op->getNumRegions() == 0 &&
+           mlir::isMemoryEffectFree(op);
+  }
+
+  HWModuleOp module;
+  SymbolTable &symbols;
+  DenseMap<Operation *, bool> pureArcs;
+};
+
 enum class Phase { Initial, Old, New, Final };
 
 template <class OS>
@@ -178,11 +264,13 @@ struct ModuleLowering {
   /// The previous reset and the value it was lowered to. This is used to reuse
   /// previous if ops for the same reset value.
   std::pair<Value, Value> prevReset;
+  bool inferInputStability;
 
-  ModuleLowering(HWModuleOp moduleOp, SymbolTable &symbolTable)
+  ModuleLowering(HWModuleOp moduleOp, SymbolTable &symbolTable,
+                 bool inferInputStability)
       : moduleOp(moduleOp), builder(moduleOp), allocBuilder(moduleOp),
         initialBuilder(moduleOp), finalBuilder(moduleOp),
-        symbolTable(symbolTable) {}
+        symbolTable(symbolTable), inferInputStability(inferInputStability) {}
   LogicalResult run();
   LogicalResult lowerOp(Operation *op);
   Value getAllocatedState(OpResult result);
@@ -205,6 +293,9 @@ LogicalResult ModuleLowering::run() {
       builder, moduleOp.getLoc(), moduleOp.getModuleNameAttr(),
       /*sym_visibility=*/{}, TypeAttr::get(moduleOp.getModuleType()),
       IntegerAttr{}, FlatSymbolRefAttr{}, FlatSymbolRefAttr{}, ArrayAttr{});
+  if (inferInputStability &&
+      InputStabilityAnalysis(moduleOp, symbolTable).check())
+    modelOp->setAttr("arc.input_stable", builder.getUnitAttr());
   auto &modelBlock = modelOp.getBody().emplaceBlock();
   storageArg = modelBlock.addArgument(StorageType::get(builder.getContext()),
                                       modelOp.getLoc());
@@ -1543,7 +1634,8 @@ void LowerStatePass::runOnOperation() {
   auto op = getOperation();
   auto &symbolTable = getAnalysis<SymbolTable>();
   for (auto moduleOp : llvm::make_early_inc_range(op.getOps<HWModuleOp>())) {
-    if (failed(ModuleLowering(moduleOp, symbolTable).run()))
+    if (failed(
+            ModuleLowering(moduleOp, symbolTable, inferInputStability).run()))
       return signalPassFailure();
     moduleOp.erase();
   }
